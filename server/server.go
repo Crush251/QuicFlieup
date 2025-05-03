@@ -1,32 +1,36 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/md5"
 	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
+	"log"
+	"net/http" // 新增标准http包
+	"net/url"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
 	"github.com/panjf2000/ants/v2"
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
 	"github.com/quic-go/quic-go/logging"
 	"github.com/quic-go/quic-go/qlog"
-	"io"
-	"log"
-	"net/http" // 新增标准http包
-	"os"
-	"path/filepath"
-	"strconv"
-	"sync"
-	"time"
 )
 
 const (
-	uploadDir      = "./uploads"     // 上传文件的保存目录
-	tempDir        = "./temp"        // 临时文件目录，用于保存分片
-	chunkSize      = 1 * 1024 * 1024 // 分片大小 (4MB)
-	workerPoolSize = 100             // 工作协程池大小
+	uploadDir      = "./uploads"       // 上传文件的保存目录
+	tempDir        = "./temp"          // 临时文件目录，用于保存分片
+	chunkSize      = 100 * 1024 * 1024 // 分片大小 (10MB)
+	workerPoolSize = 100               // 工作协程池大小
 )
 
 // 文件信息结构
@@ -70,6 +74,13 @@ func main() {
 	quicConfig := &quic.Config{
 		EnableDatagrams: true,
 		Allow0RTT:       true,
+		// 流控制参数设置
+		MaxStreamReceiveWindow:     20 * 1024 * 1024,  // 20MB的流接收窗口
+		MaxConnectionReceiveWindow: 100 * 1024 * 1024, // 100MB的连接接收窗口
+		MaxIdleTimeout:             120 * time.Second, // 增加到120秒
+		HandshakeIdleTimeout:       30 * time.Second,  // 握手超时
+		InitialStreamReceiveWindow: 512 * 1024,        // 初始流接收窗口
+		MaxIncomingStreams:         1000,              // 最大并发流数量
 		// 更新QLOG支持
 		Tracer: func(ctx context.Context, p logging.Perspective, ci quic.ConnectionID) *logging.ConnectionTracer {
 			filename := fmt.Sprintf("./qlog-%s-%x.qlog", p, ci.Bytes())
@@ -99,6 +110,9 @@ func main() {
 		QUICConfig: quicConfig,
 		Handler:    setupHandlers(pool),
 	}
+
+	// 启动监听QUIC连接处理直接流传输
+	go handleDirectQUICConnections(tlsConfig, quicConfig, pool)
 
 	log.Println("HTTP/3服务器启动在 https://localhost:4433")
 	err = server.ListenAndServe()
@@ -445,5 +459,405 @@ func http3Error(w http.ResponseWriter, message string, statusCode int) {
 	}
 	if err := json.NewEncoder(w).Encode(resp); err != nil {
 		log.Printf("编码错误响应失败: %v", err)
+	}
+}
+
+// 处理直接的QUIC连接
+func handleDirectQUICConnections(tlsConfig *tls.Config, quicConfig *quic.Config, pool *ants.Pool) {
+	log.Println("启动QUIC直接流处理监听在 :4434")
+
+	// 创建QUIC监听器 - 使用不同端口以避免和HTTP/3服务器冲突
+	listener, err := quic.ListenAddr(":4434", tlsConfig, quicConfig)
+	if err != nil {
+		log.Fatalf("创建QUIC监听器失败: %v", err)
+		return
+	}
+
+	// 接受连接
+	for {
+		conn, err := listener.Accept(context.Background())
+		if err != nil {
+			log.Printf("接受QUIC连接失败: %v", err)
+			continue
+		}
+
+		// 为每个连接启动一个处理goroutine
+		go handleQuicConnection(conn, pool)
+	}
+}
+
+// 处理单个QUIC连接
+func handleQuicConnection(conn quic.Connection, pool *ants.Pool) {
+	log.Printf("接受来自 %s 的QUIC连接", conn.RemoteAddr())
+
+	// 接受连接上的所有流
+	for {
+		stream, err := conn.AcceptStream(context.Background())
+		if err != nil {
+			log.Printf("接受流失败: %v", err)
+			break
+		}
+
+		// 处理每个流
+		err = pool.Submit(func() {
+			handleQuicStream(stream)
+		})
+
+		if err != nil {
+			log.Printf("提交流处理任务失败: %v", err)
+			stream.Close()
+		}
+	}
+}
+
+// 处理单个QUIC流请求
+func handleQuicStream(stream quic.Stream) {
+	defer stream.Close()
+
+	// 读取HTTP请求头
+	reqBuf := make([]byte, 4096)
+	n, err := stream.Read(reqBuf)
+	if err != nil && err != io.EOF {
+		log.Printf("读取请求头失败: %v", err)
+		return
+	}
+
+	// 解析HTTP请求
+	reqStr := string(reqBuf[:n])
+	requestLines := strings.Split(reqStr, "\r\n")
+	if len(requestLines) < 1 {
+		log.Printf("无效的HTTP请求: %s", reqStr)
+		return
+	}
+
+	// 解析请求行
+	requestParts := strings.Split(requestLines[0], " ")
+	if len(requestParts) < 2 {
+		log.Printf("无效的HTTP请求行: %s", requestLines[0])
+		return
+	}
+
+	// method变量暂时未使用，但保留以便将来扩展
+	// 目前只处理POST请求
+	_ = requestParts[0] // 忽略method变量
+	path := requestParts[1]
+
+	// 查找Content-Length
+	var contentLength int64
+	for _, line := range requestLines {
+		if strings.HasPrefix(strings.ToLower(line), "content-length:") {
+			lenStr := strings.TrimSpace(line[len("content-length:"):])
+			contentLength, _ = strconv.ParseInt(lenStr, 10, 64)
+		}
+	}
+
+	// 找到请求体的起始位置
+	bodyStartIdx := bytes.Index(reqBuf[:n], []byte("\r\n\r\n"))
+	if bodyStartIdx == -1 {
+		log.Printf("未找到请求体: %s", reqStr)
+		return
+	}
+	bodyStartIdx += 4 // 跳过"\r\n\r\n"
+
+	// 处理不同的API路径
+	switch {
+	case strings.HasPrefix(path, "/api/streamUploadChunk"):
+		handleStreamUploadChunk(stream, path, reqBuf[:n][bodyStartIdx:], contentLength-int64(n-bodyStartIdx))
+	case path == "/api/initUpload":
+		handleStreamInitUpload(stream, reqBuf[:n][bodyStartIdx:])
+	case path == "/api/completeUpload":
+		handleStreamCompleteUpload(stream, reqBuf[:n][bodyStartIdx:])
+	default:
+		sendErrorResponse(stream, "未知的API路径", 404)
+	}
+}
+
+// 处理流式上传分片
+func handleStreamUploadChunk(stream quic.Stream, path string, initialBody []byte, remainingBytes int64) {
+	// 记录开始时间，用于计算处理时间
+	startTime := time.Now()
+
+	// 解析查询参数
+	u, err := url.Parse(path)
+	if err != nil {
+		sendErrorResponse(stream, "解析路径失败", 400)
+		return
+	}
+
+	query := u.Query()
+	fileID := query.Get("fileId")
+	chunkNumStr := query.Get("chunkNum")
+
+	if fileID == "" || chunkNumStr == "" {
+		sendErrorResponse(stream, "缺少必要参数", 400)
+		return
+	}
+
+	chunkNum, err := strconv.Atoi(chunkNumStr)
+	if err != nil {
+		sendErrorResponse(stream, "无效的分片序号", 400)
+		return
+	}
+
+	log.Printf("开始处理分片: %s - %d", fileID, chunkNum)
+
+	fileInfoMapLock.RLock()
+	_, exists := fileInfoMap[fileID]
+	fileInfoMapLock.RUnlock()
+
+	if !exists {
+		sendErrorResponse(stream, "文件信息不存在", 404)
+		return
+	}
+
+	// 确保目录存在
+	chunkDir := filepath.Join(tempDir, fileID)
+	if err := os.MkdirAll(chunkDir, 0755); err != nil {
+		sendErrorResponse(stream, fmt.Sprintf("创建分片目录失败: %v", err), 500)
+		return
+	}
+
+	// 保存分片文件
+	chunkPath := filepath.Join(chunkDir, chunkNumStr)
+	out, err := os.Create(chunkPath)
+	if err != nil {
+		sendErrorResponse(stream, fmt.Sprintf("创建分片文件失败: %v", err), 500)
+		return
+	}
+	defer out.Close()
+
+	// 首先写入初始读取的数据
+	if len(initialBody) > 0 {
+		if _, err := out.Write(initialBody); err != nil {
+			os.Remove(chunkPath) // 清理不完整的文件
+			sendErrorResponse(stream, fmt.Sprintf("写入分片数据失败: %v", err), 500)
+			return
+		}
+	}
+
+	// 设置处理超时 - 最多给120秒完成分片传输
+	if err := stream.SetReadDeadline(time.Now().Add(120 * time.Second)); err != nil {
+		log.Printf("设置读取超时失败: %v", err)
+	}
+
+	// 读取剩余数据
+	if remainingBytes > 0 {
+		// 使用缓冲区读取以提高性能
+		buffer := make([]byte, 64*1024) // 增加到64KB缓冲区
+		var totalRead int64
+
+		for totalRead < remainingBytes {
+			toRead := remainingBytes - totalRead
+			if toRead > int64(len(buffer)) {
+				toRead = int64(len(buffer))
+			}
+
+			n, err := stream.Read(buffer[:toRead])
+			if err != nil && err != io.EOF {
+				os.Remove(chunkPath) // 清理不完整的文件
+				sendErrorResponse(stream, fmt.Sprintf("读取分片数据失败: %v", err), 500)
+				return
+			}
+
+			if n > 0 {
+				if _, err := out.Write(buffer[:n]); err != nil {
+					os.Remove(chunkPath) // 清理不完整的文件
+					sendErrorResponse(stream, fmt.Sprintf("写入分片数据失败: %v", err), 500)
+					return
+				}
+				totalRead += int64(n)
+			}
+
+			if err == io.EOF || n == 0 {
+				break
+			}
+		}
+
+		// 检查是否读取了所有数据
+		if totalRead < remainingBytes {
+			os.Remove(chunkPath) // 清理不完整的文件
+			sendErrorResponse(stream, fmt.Sprintf("数据不完整: 预期 %d 字节, 实际读取 %d 字节", remainingBytes, totalRead), 400)
+			return
+		}
+	}
+
+	// 成功完成，同步写入磁盘
+	if err := out.Sync(); err != nil {
+		log.Printf("同步文件到磁盘失败: %v", err)
+	}
+
+	// 重置读取超时为响应的合理值
+	if err := stream.SetReadDeadline(time.Time{}); err != nil {
+		log.Printf("重置读取超时失败: %v", err)
+	}
+
+	// 计算处理时间
+	processingTime := time.Since(startTime)
+
+	// 发送成功响应
+	response := map[string]interface{}{
+		"success":  true,
+		"message":  fmt.Sprintf("分片 %d 上传成功", chunkNum),
+		"fileId":   fileID,
+		"chunkNum": chunkNum,
+		"time":     processingTime.Seconds(), // 包含处理时间信息
+	}
+
+	log.Printf("完成处理分片: %s - %d, 耗时: %.2f秒", fileID, chunkNum, processingTime.Seconds())
+	sendSuccessResponse(stream, response)
+}
+
+// 处理流式初始化上传
+func handleStreamInitUpload(stream quic.Stream, body []byte) {
+	var fileInfo FileInfo
+	if err := json.Unmarshal(body, &fileInfo); err != nil {
+		sendErrorResponse(stream, "无效的请求数据", 400)
+		return
+	}
+
+	// 检查是否可以秒传
+	fileHashLock.RLock()
+	existingFileID, exists := fileHashMap[fileInfo.FileHash]
+	fileHashLock.RUnlock()
+
+	if exists {
+		// 文件已存在，可以秒传
+		fileInfoMapLock.RLock()
+		existingFile := fileInfoMap[existingFileID]
+		fileInfoMapLock.RUnlock()
+
+		if existingFile != nil && existingFile.IsCompleted {
+			response := map[string]interface{}{
+				"success":       true,
+				"message":       "文件已存在，秒传成功",
+				"instantUpload": true,
+				"fileInfo":      existingFile,
+			}
+			sendSuccessResponse(stream, response)
+			return
+		}
+	}
+
+	// 设置文件信息
+	fileInfo.CreatedAt = time.Now()
+	fileInfo.IsCompleted = false
+	fileInfo.ChunkCount = int((fileInfo.FileSize + chunkSize - 1) / chunkSize)
+
+	// 保存文件信息
+	fileInfoMapLock.Lock()
+	fileInfoMap[fileInfo.FileID] = &fileInfo
+	fileInfoMapLock.Unlock()
+
+	// 创建文件的临时目录
+	chunkDir := filepath.Join(tempDir, fileInfo.FileID)
+	if err := os.MkdirAll(chunkDir, 0755); err != nil {
+		sendErrorResponse(stream, "创建文件临时目录失败", 500)
+		return
+	}
+
+	response := map[string]interface{}{
+		"success":       true,
+		"message":       "初始化上传成功",
+		"instantUpload": false,
+		"fileInfo":      fileInfo,
+	}
+	sendSuccessResponse(stream, response)
+}
+
+// 处理流式完成上传
+func handleStreamCompleteUpload(stream quic.Stream, body []byte) {
+	var completeReq struct {
+		FileID string `json:"fileId"`
+	}
+
+	if err := json.Unmarshal(body, &completeReq); err != nil {
+		sendErrorResponse(stream, "无效的请求数据", 400)
+		return
+	}
+
+	fileID := completeReq.FileID
+	fileInfoMapLock.RLock()
+	fileInfo, exists := fileInfoMap[fileID]
+	fileInfoMapLock.RUnlock()
+
+	if !exists {
+		sendErrorResponse(stream, "文件信息不存在", 404)
+		return
+	}
+
+	// 提交合并任务
+	go mergeChunksAndVerify(fileInfo)
+
+	response := map[string]interface{}{
+		"success": true,
+		"message": "文件合并任务已提交",
+		"fileId":  fileID,
+	}
+	sendSuccessResponse(stream, response)
+}
+
+// 发送成功响应
+func sendSuccessResponse(stream quic.Stream, data interface{}) {
+	// 序列化响应数据
+	respData, err := json.Marshal(data)
+	if err != nil {
+		log.Printf("序列化响应失败: %v", err)
+		return
+	}
+
+	// 发送HTTP响应
+	headers := fmt.Sprintf(
+		"HTTP/1.1 200 OK\r\n"+
+			"Content-Type: application/json\r\n"+
+			"Content-Length: %d\r\n\r\n",
+		len(respData))
+
+	if _, err := stream.Write([]byte(headers)); err != nil {
+		log.Printf("发送响应头失败: %v", err)
+		return
+	}
+
+	if _, err := stream.Write(respData); err != nil {
+		log.Printf("发送响应数据失败: %v", err)
+	}
+}
+
+// 发送错误响应
+func sendErrorResponse(stream quic.Stream, message string, statusCode int) {
+	log.Printf("错误: %s [%d]", message, statusCode)
+
+	// 创建错误响应
+	errResp := map[string]interface{}{
+		"success": false,
+		"message": message,
+	}
+
+	// 序列化响应数据
+	respData, err := json.Marshal(errResp)
+	if err != nil {
+		log.Printf("序列化错误响应失败: %v", err)
+		return
+	}
+
+	// 获取状态文本
+	statusText := http.StatusText(statusCode)
+	if statusText == "" {
+		statusText = "Error"
+	}
+
+	// 发送HTTP响应
+	headers := fmt.Sprintf(
+		"HTTP/1.1 %d %s\r\n"+
+			"Content-Type: application/json\r\n"+
+			"Content-Length: %d\r\n\r\n",
+		statusCode, statusText, len(respData))
+
+	if _, err := stream.Write([]byte(headers)); err != nil {
+		log.Printf("发送错误响应头失败: %v", err)
+		return
+	}
+
+	if _, err := stream.Write(respData); err != nil {
+		log.Printf("发送错误响应数据失败: %v", err)
 	}
 }

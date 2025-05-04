@@ -1,4 +1,4 @@
-package main
+package server
 
 import (
 	"bytes"
@@ -18,6 +18,10 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"QuicFlieup/server/handler"
+	"QuicFlieup/server/service"
+	"QuicFlieup/server/utils"
 
 	"github.com/panjf2000/ants/v2"
 	"github.com/quic-go/quic-go"
@@ -59,7 +63,164 @@ var (
 	fileHashLock    sync.RWMutex                 // 读写锁保护哈希映射表
 )
 
-func main() {
+// Server 结构体定义
+type Server struct {
+	DBService    *service.DBService
+	RedisService *service.RedisService
+	MQService    *service.MQService
+	MergeService *service.MergeService
+	UserHandler  *handler.UserHandler
+}
+
+// NewServer 创建服务器实例
+func NewServer() *Server {
+	return &Server{}
+}
+
+// Start 启动服务器
+func (s *Server) Start() error {
+	// 确保上传和临时目录存在
+	ensureDirectories()
+
+	// 初始化数据库服务
+	dbService, err := service.NewDBService(
+		"mysql",
+		service.CreateMySQLDataSource("root", "qwer11023", "localhost", 3306, "quicfileup"),
+	)
+	if err != nil {
+		return fmt.Errorf("初始化数据库服务失败: %w", err)
+	}
+	s.DBService = dbService
+	defer dbService.Close()
+
+	// 初始化Redis服务
+	redisService := service.NewRedisService("localhost:6379", "", 0)
+	s.RedisService = redisService
+	defer redisService.Close()
+
+	// 初始化RabbitMQ服务
+	mqService, err := service.NewMQService("amqp://guest:guest@localhost:5672/")
+	if err != nil {
+		return fmt.Errorf("初始化MQ服务失败: %w", err)
+	}
+	s.MQService = mqService
+	defer mqService.Close()
+
+	// 初始化文件合并服务
+	mergeService := service.NewMergeService(mqService, redisService, dbService, uploadDir, tempDir, chunkSize)
+	s.MergeService = mergeService
+
+	// 启动文件合并工作线程
+	if err := mergeService.StartMergeWorker(context.Background()); err != nil {
+		return fmt.Errorf("启动合并工作线程失败: %w", err)
+	}
+
+	// 初始化用户处理器
+	s.UserHandler = handler.NewUserHandler(dbService)
+
+	// 为了保持向后兼容，也调用原来的ServerRun函数
+	go ServerRun()
+
+	// 启动HTTP服务器
+	return s.startHTTPServer()
+}
+
+// startHTTPServer 启动标准HTTP服务器
+func (s *Server) startHTTPServer() error {
+	// 创建路由器
+	mux := http.NewServeMux()
+
+	// 注册用户相关路由
+	mux.HandleFunc("/api/user/register", s.UserHandler.Register)
+	mux.HandleFunc("/api/user/login", s.UserHandler.Login)
+	mux.HandleFunc("/api/user/info", withAuth(s.UserHandler.GetUserInfo))
+	mux.HandleFunc("/api/user/logout", s.UserHandler.Logout)
+
+	// 创建文件处理器
+	fileHandler := handler.NewFileHandler(
+		s.DBService,
+		s.RedisService,
+		s.MQService,
+		s.MergeService,
+		uploadDir,
+		tempDir,
+		chunkSize,
+	)
+
+	// 注册文件相关路由
+	mux.HandleFunc("/api/initUpload", withAuth(fileHandler.InitUpload))
+	mux.HandleFunc("/api/uploadChunk", withAuth(fileHandler.UploadChunk))
+	mux.HandleFunc("/api/getUploadedChunks", withAuth(fileHandler.GetUploadedChunks))
+	mux.HandleFunc("/api/completeUpload", withAuth(fileHandler.CompleteUpload))
+	mux.HandleFunc("/api/userFiles", withAuth(fileHandler.GetUserFiles))
+	mux.HandleFunc("/api/downloadFile", withAuth(fileHandler.DownloadFile))
+
+	// 加载证书
+	cert, err := tls.LoadX509KeyPair("cert.pem", "key.pem")
+	if err != nil {
+		return fmt.Errorf("加载证书失败: %w", err)
+	}
+
+	// 创建TLS配置
+	tlsConfig := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+	}
+
+	// 创建HTTPS服务器
+	server := &http.Server{
+		Addr:      ":8443",
+		Handler:   mux,
+		TLSConfig: tlsConfig,
+	}
+
+	log.Println("HTTP服务器启动在 https://localhost:8443")
+	return server.ListenAndServeTLS("", "")
+}
+
+// 添加该函数增加认证中间件
+func withAuth(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// 从请求中获取Token
+		token := r.Header.Get("Authorization")
+		if token == "" {
+			// 尝试从Cookie中获取
+			cookie, err := r.Cookie("token")
+			if err == nil {
+				token = cookie.Value
+			}
+		} else {
+			// 从"Bearer "格式中提取
+			parts := strings.Split(token, " ")
+			if len(parts) == 2 && parts[0] == "Bearer" {
+				token = parts[1]
+			}
+		}
+
+		if token == "" {
+			utils.JSONResponse(w, http.StatusUnauthorized, map[string]interface{}{
+				"success": false,
+				"message": "未授权：需要登录",
+			})
+			return
+		}
+
+		// 验证Token并获取用户ID
+		userID, err := utils.ValidateJWT(token)
+		if err != nil {
+			utils.JSONResponse(w, http.StatusUnauthorized, map[string]interface{}{
+				"success": false,
+				"message": "未授权：无效的令牌",
+			})
+			return
+		}
+
+		// 将用户ID添加到请求上下文
+		ctx := context.WithValue(r.Context(), "userID", userID)
+		next(w, r.WithContext(ctx))
+	}
+}
+
+func ServerRun() {
 	// 确保上传和临时目录存在
 	ensureDirectories()
 

@@ -4,13 +4,18 @@ import (
 	"QuicFlieup/server/model"
 	"QuicFlieup/server/service"
 	"QuicFlieup/server/utils"
+	"crypto/md5"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
+
+	"bytes"
 
 	"github.com/google/uuid"
 )
@@ -28,10 +33,11 @@ type FileHandler struct {
 
 // FileUploadInitRequest 文件上传初始化请求
 type FileUploadInitRequest struct {
-	FileName   string `json:"fileName"`
-	FileSize   int64  `json:"fileSize"`
-	FileHash   string `json:"fileHash"`
-	ChunkCount int    `json:"chunkCount"`
+	FileID     string `json:"fileId"`     // 客户端指定的文件ID，可选
+	FileName   string `json:"fileName"`   // 文件名
+	FileSize   int64  `json:"fileSize"`   // 文件大小
+	FileHash   string `json:"fileHash"`   // 文件MD5哈希值
+	ChunkCount int    `json:"chunkCount"` // 分片总数
 }
 
 // ChunkUploadRequest 分片上传请求
@@ -81,24 +87,58 @@ func (h *FileHandler) InitUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	ctx := r.Context()
+
+	// 记录原始请求内容
+	requestBody, err := io.ReadAll(r.Body)
+	if err != nil {
+		log.Printf("读取请求体失败: %v", err)
+		utils.JSONResponse(w, http.StatusBadRequest, map[string]interface{}{
+			"success": false,
+			"message": "读取请求体失败",
+		})
+		return
+	}
+	r.Body = io.NopCloser(bytes.NewBuffer(requestBody))
+
+	log.Printf("收到初始化上传请求: 用户ID=%d, 请求体=%s", userID, string(requestBody))
+
 	// 解析请求体
 	var req FileUploadInitRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		log.Printf("解析请求失败: %v, 原始内容: %s", err, string(requestBody))
 		utils.JSONResponse(w, http.StatusBadRequest, map[string]interface{}{
 			"success": false,
-			"message": "无效的请求数据",
+			"message": "无效的请求数据: " + err.Error(),
 		})
 		return
 	}
 
-	ctx := r.Context()
+	log.Printf("文件上传初始化: 用户ID=%d, 文件名=%s, 大小=%.2fMB, 哈希=%s",
+		userID, req.FileName, float64(req.FileSize)/(1024*1024), req.FileHash)
+
+	// 验证请求参数
+	if req.FileName == "" || req.FileSize <= 0 || req.FileHash == "" {
+		log.Printf("请求参数无效: 文件名=%s, 大小=%d, 哈希=%s",
+			req.FileName, req.FileSize, req.FileHash)
+		utils.JSONResponse(w, http.StatusBadRequest, map[string]interface{}{
+			"success": false,
+			"message": "请求参数无效",
+		})
+		return
+	}
 
 	// 检查是否可以秒传（通过Redis中的文件哈希）
 	fileID, err := h.redisService.GetFileIDByHash(ctx, req.FileHash)
 	if err == nil && fileID != "" {
+		log.Printf("发现相同哈希文件: 哈希=%s, 文件ID=%s", req.FileHash, fileID)
+
 		// 从数据库中获取文件信息
 		file, err := model.GetFileByID(h.dbService.DB, fileID)
 		if err == nil && file != nil && file.IsCompleted {
+			log.Printf("秒传条件满足: 文件=%s, 大小=%.2fMB",
+				file.FileName, float64(file.FileSize)/(1024*1024))
+
 			// 创建一个新的文件记录，指向现有的文件
 			newFileID := uuid.New().String()
 			newFile := &model.FileInfo{
@@ -112,6 +152,7 @@ func (h *FileHandler) InitUpload(w http.ResponseWriter, r *http.Request) {
 			}
 
 			if err := model.CreateFile(h.dbService.DB, newFile); err != nil {
+				log.Printf("创建文件记录失败: %v", err)
 				utils.JSONResponse(w, http.StatusInternalServerError, map[string]interface{}{
 					"success": false,
 					"message": "创建文件记录失败: " + err.Error(),
@@ -119,8 +160,22 @@ func (h *FileHandler) InitUpload(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 
+			// 保存新文件信息到Redis
+			if err := h.redisService.SaveFileInfo(ctx, newFileID, newFile); err != nil {
+				log.Printf("保存文件信息到Redis失败: %v", err)
+				// 继续处理，不中断流程
+			} else {
+				log.Printf("文件信息已保存到Redis: ID=%s", newFileID)
+			}
+
 			// 添加到用户的文件列表
-			h.redisService.AddFileToUser(ctx, userID, newFileID)
+			if err := h.redisService.AddFileToUser(ctx, userID, newFileID); err != nil {
+				log.Printf("添加到用户文件列表失败: %v", err)
+				// 继续处理，不中断流程
+			}
+
+			log.Printf("秒传成功: 用户ID=%d, 文件名=%s, 新文件ID=%s",
+				userID, req.FileName, newFileID)
 
 			utils.JSONResponse(w, http.StatusOK, map[string]interface{}{
 				"success":       true,
@@ -136,11 +191,28 @@ func (h *FileHandler) InitUpload(w http.ResponseWriter, r *http.Request) {
 				},
 			})
 			return
+		} else {
+			log.Printf("文件ID存在但状态不满足秒传条件: ID=%s, 错误=%v", fileID, err)
+		}
+	} else {
+		if err != nil {
+			log.Printf("Redis中查询哈希失败: %v", err)
+		} else {
+			log.Printf("Redis中未找到匹配哈希: %s", req.FileHash)
 		}
 	}
 
 	// 生成文件ID
-	newFileID := uuid.New().String()
+	newFileID := req.FileID
+	if newFileID == "" {
+		newFileID = uuid.New().String()
+	}
+
+	// 计算分片数量
+	chunkCount := req.ChunkCount
+	if chunkCount <= 0 {
+		chunkCount = int((req.FileSize + h.chunkSize - 1) / h.chunkSize)
+	}
 
 	// 创建文件信息
 	fileInfo := &model.FileInfo{
@@ -149,37 +221,53 @@ func (h *FileHandler) InitUpload(w http.ResponseWriter, r *http.Request) {
 		FileName:    req.FileName,
 		FileSize:    req.FileSize,
 		FileHash:    req.FileHash,
-		ChunkCount:  req.ChunkCount,
+		ChunkCount:  chunkCount,
 		IsCompleted: false,
 	}
 
+	log.Printf("开始新文件上传: ID=%s, 用户=%d, 文件名=%s, 分片数=%d, 哈希=%s",
+		newFileID, userID, req.FileName, chunkCount, req.FileHash)
+
 	// 保存到数据库
 	if err := model.CreateFile(h.dbService.DB, fileInfo); err != nil {
+		log.Printf("创建文件数据库记录失败: %v", err)
 		utils.JSONResponse(w, http.StatusInternalServerError, map[string]interface{}{
 			"success": false,
 			"message": "创建文件记录失败: " + err.Error(),
 		})
 		return
 	}
+	log.Printf("文件信息已保存到数据库: ID=%s", newFileID)
 
 	// 保存文件信息到Redis
 	if err := h.redisService.SaveFileInfo(ctx, newFileID, fileInfo); err != nil {
 		// 仅记录错误，不中断流程
-		fmt.Printf("保存文件信息到Redis失败: %v\n", err)
+		log.Printf("保存文件信息到Redis失败: %v", err)
+	} else {
+		log.Printf("文件信息已保存到Redis: ID=%s", newFileID)
 	}
 
 	// 添加到用户的文件列表
-	h.redisService.AddFileToUser(ctx, userID, newFileID)
+	if err := h.redisService.AddFileToUser(ctx, userID, newFileID); err != nil {
+		log.Printf("添加到用户文件列表失败: %v", err)
+		// 继续处理，不中断流程
+	} else {
+		log.Printf("文件已添加到用户文件列表: 用户ID=%d, 文件ID=%s", userID, newFileID)
+	}
 
 	// 创建文件的临时目录
 	chunkDir := filepath.Join(h.tempDir, newFileID)
 	if err := os.MkdirAll(chunkDir, 0755); err != nil {
+		log.Printf("创建临时目录失败: %v", err)
 		utils.JSONResponse(w, http.StatusInternalServerError, map[string]interface{}{
 			"success": false,
 			"message": "创建临时目录失败: " + err.Error(),
 		})
 		return
 	}
+
+	log.Printf("文件上传初始化成功: ID=%s, 用户=%d, 文件名=%s",
+		newFileID, userID, req.FileName)
 
 	utils.JSONResponse(w, http.StatusOK, map[string]interface{}{
 		"success":       true,
@@ -190,7 +278,7 @@ func (h *FileHandler) InitUpload(w http.ResponseWriter, r *http.Request) {
 			"fileName":    req.FileName,
 			"fileSize":    req.FileSize,
 			"fileHash":    req.FileHash,
-			"chunkCount":  req.ChunkCount,
+			"chunkCount":  chunkCount,
 			"isCompleted": false,
 		},
 	})
@@ -245,7 +333,7 @@ func (h *FileHandler) UploadChunk(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 从上下文中获取用户ID
-	_, ok := r.Context().Value("userID").(int)
+	userID, ok := r.Context().Value("userID").(int)
 	if !ok {
 		utils.JSONResponse(w, http.StatusUnauthorized, map[string]interface{}{
 			"success": false,
@@ -259,6 +347,7 @@ func (h *FileHandler) UploadChunk(w http.ResponseWriter, r *http.Request) {
 
 	// 解析多部分表单
 	if err := r.ParseMultipartForm(32 << 20); err != nil {
+		log.Printf("解析表单失败: %v", err)
 		utils.JSONResponse(w, http.StatusBadRequest, map[string]interface{}{
 			"success": false,
 			"message": "解析表单失败: " + err.Error(),
@@ -287,11 +376,14 @@ func (h *FileHandler) UploadChunk(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	log.Printf("分片上传请求: 用户ID=%d, 文件ID=%s, 分片=%d", userID, fileID, chunkNum)
+
 	ctx := r.Context()
 
 	// 检查分片是否已上传
 	isUploaded, err := h.redisService.IsChunkUploaded(ctx, fileID, chunkNum)
 	if err == nil && isUploaded {
+		log.Printf("分片已存在，跳过: 文件ID=%s, 分片=%d", fileID, chunkNum)
 		utils.JSONResponse(w, http.StatusOK, map[string]interface{}{
 			"success":  true,
 			"message":  "分片已存在",
@@ -301,8 +393,9 @@ func (h *FileHandler) UploadChunk(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 获取上传的文件
-	file, _, err := r.FormFile("chunk")
+	file, fileHeader, err := r.FormFile("chunk")
 	if err != nil {
+		log.Printf("获取上传文件失败: %v", err)
 		utils.JSONResponse(w, http.StatusBadRequest, map[string]interface{}{
 			"success": false,
 			"message": "获取上传文件失败: " + err.Error(),
@@ -311,12 +404,16 @@ func (h *FileHandler) UploadChunk(w http.ResponseWriter, r *http.Request) {
 	}
 	defer file.Close()
 
+	log.Printf("接收到分片数据: 文件ID=%s, 分片=%d, 大小=%d bytes",
+		fileID, chunkNum, fileHeader.Size)
+
 	// 创建分片文件
 	chunkDir := filepath.Join(h.tempDir, fileID)
 	chunkPath := filepath.Join(chunkDir, strconv.Itoa(chunkNum))
 
 	// 确保目录存在
 	if err := os.MkdirAll(chunkDir, 0755); err != nil {
+		log.Printf("创建目录失败: %v", err)
 		utils.JSONResponse(w, http.StatusInternalServerError, map[string]interface{}{
 			"success": false,
 			"message": "创建目录失败: " + err.Error(),
@@ -327,6 +424,7 @@ func (h *FileHandler) UploadChunk(w http.ResponseWriter, r *http.Request) {
 	// 创建目标文件
 	out, err := os.Create(chunkPath)
 	if err != nil {
+		log.Printf("创建文件失败: %v", err)
 		utils.JSONResponse(w, http.StatusInternalServerError, map[string]interface{}{
 			"success": false,
 			"message": "创建文件失败: " + err.Error(),
@@ -336,9 +434,10 @@ func (h *FileHandler) UploadChunk(w http.ResponseWriter, r *http.Request) {
 	defer out.Close()
 
 	// 写入文件
-	_, err = io.Copy(out, file)
+	written, err := io.Copy(out, file)
 	if err != nil {
 		os.Remove(chunkPath) // 删除不完整的文件
+		log.Printf("写入文件失败: %v", err)
 		utils.JSONResponse(w, http.StatusInternalServerError, map[string]interface{}{
 			"success": false,
 			"message": "写入文件失败: " + err.Error(),
@@ -347,8 +446,8 @@ func (h *FileHandler) UploadChunk(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 确保写入磁盘
-	err = out.Sync()
-	if err != nil {
+	if err = out.Sync(); err != nil {
+		log.Printf("同步文件失败: %v", err)
 		utils.JSONResponse(w, http.StatusInternalServerError, map[string]interface{}{
 			"success": false,
 			"message": "同步文件失败: " + err.Error(),
@@ -356,10 +455,13 @@ func (h *FileHandler) UploadChunk(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	log.Printf("分片写入成功: 文件ID=%s, 分片=%d, 写入大小=%d bytes",
+		fileID, chunkNum, written)
+
 	// 更新Redis中的分片记录
 	if err := h.redisService.AddUploadedChunk(ctx, fileID, chunkNum); err != nil {
 		// 仅记录错误，不中断流程
-		fmt.Printf("更新Redis分片记录失败: %v\n", err)
+		log.Printf("更新Redis分片记录失败: %v", err)
 	}
 
 	utils.JSONResponse(w, http.StatusOK, map[string]interface{}{
@@ -367,6 +469,22 @@ func (h *FileHandler) UploadChunk(w http.ResponseWriter, r *http.Request) {
 		"message":  "分片上传成功",
 		"chunkNum": chunkNum,
 	})
+}
+
+// 计算文件哈希值
+func calculateFileHash(filePath string) (string, error) {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+
+	hash := md5.New()
+	if _, err := io.Copy(hash, file); err != nil {
+		return "", err
+	}
+
+	return hex.EncodeToString(hash.Sum(nil)), nil
 }
 
 // CompleteUpload 完成文件上传
@@ -394,10 +512,25 @@ func (h *FileHandler) CompleteUpload(w http.ResponseWriter, r *http.Request) {
 		FileID string `json:"fileId"`
 	}
 
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	// 记录原始请求内容
+	requestBody, err := io.ReadAll(r.Body)
+	if err != nil {
+		log.Printf("读取请求体失败: %v", err)
 		utils.JSONResponse(w, http.StatusBadRequest, map[string]interface{}{
 			"success": false,
-			"message": "无效的请求数据",
+			"message": "读取请求体失败",
+		})
+		return
+	}
+	r.Body = io.NopCloser(bytes.NewBuffer(requestBody))
+
+	log.Printf("收到完成上传请求: 用户ID=%d, 请求体=%s", userID, string(requestBody))
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		log.Printf("解析请求失败: %v, 原始内容: %s", err, string(requestBody))
+		utils.JSONResponse(w, http.StatusBadRequest, map[string]interface{}{
+			"success": false,
+			"message": "无效的请求数据: " + err.Error(),
 		})
 		return
 	}
@@ -410,18 +543,43 @@ func (h *FileHandler) CompleteUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 获取文件信息
-	fileInfo, err := model.GetFileByID(h.dbService.DB, req.FileID)
-	if err != nil || fileInfo == nil {
-		utils.JSONResponse(w, http.StatusBadRequest, map[string]interface{}{
-			"success": false,
-			"message": "文件信息不存在",
-		})
-		return
+	log.Printf("文件上传完成请求: 用户ID=%d, 文件ID=%s", userID, req.FileID)
+
+	ctx := r.Context()
+
+	// 首先尝试从Redis获取文件信息
+	var fileInfo model.FileInfo
+	err = h.redisService.GetFileInfo(ctx, req.FileID, &fileInfo)
+	if err != nil {
+		log.Printf("从Redis获取文件信息失败, 尝试从数据库获取: %v", err)
+
+		// 从数据库获取文件信息
+		dbFileInfo, err := model.GetFileByID(h.dbService.DB, req.FileID)
+		if err != nil || dbFileInfo == nil {
+			log.Printf("从数据库获取文件信息失败: %v", err)
+			utils.JSONResponse(w, http.StatusBadRequest, map[string]interface{}{
+				"success": false,
+				"message": "文件信息不存在",
+			})
+			return
+		}
+
+		fileInfo = *dbFileInfo
+
+		// 尝试将文件信息保存到Redis
+		if err := h.redisService.SaveFileInfo(ctx, req.FileID, fileInfo); err != nil {
+			log.Printf("将文件信息保存到Redis失败: %v", err)
+			// 继续处理，不中断流程
+		} else {
+			log.Printf("文件信息已保存到Redis: %s", req.FileID)
+		}
+	} else {
+		log.Printf("从Redis获取到文件信息: ID=%s, 文件名=%s", fileInfo.FileID, fileInfo.FileName)
 	}
 
 	// 检查文件是否属于当前用户
 	if fileInfo.UserID != userID {
+		log.Printf("文件所有权验证失败: 期望用户=%d, 实际用户=%d", userID, fileInfo.UserID)
 		utils.JSONResponse(w, http.StatusForbidden, map[string]interface{}{
 			"success": false,
 			"message": "无权访问该文件",
@@ -429,17 +587,65 @@ func (h *FileHandler) CompleteUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx := r.Context()
-
 	// 验证所有分片是否都已上传
 	chunks, err := h.redisService.GetUploadedChunks(ctx, req.FileID)
-	if err != nil || len(chunks) != fileInfo.ChunkCount {
+	if err != nil {
+		log.Printf("获取已上传分片失败: %v", err)
+
+		// 检查临时目录中实际存在的分片
+		chunkDir := filepath.Join(h.tempDir, req.FileID)
+		if _, err := os.Stat(chunkDir); os.IsNotExist(err) {
+			log.Printf("分片目录不存在: %s", chunkDir)
+			utils.JSONResponse(w, http.StatusBadRequest, map[string]interface{}{
+				"success": false,
+				"message": "分片目录不存在",
+			})
+			return
+		}
+
+		// 统计目录中的分片数量
+		files, err := os.ReadDir(chunkDir)
+		if err != nil {
+			log.Printf("读取分片目录失败: %v", err)
+			utils.JSONResponse(w, http.StatusInternalServerError, map[string]interface{}{
+				"success": false,
+				"message": "读取分片目录失败: " + err.Error(),
+			})
+			return
+		}
+
+		// 统计实际分片数量
+		chunks = make([]int, 0, len(files))
+		for _, file := range files {
+			if !file.IsDir() {
+				chunkNum, err := strconv.Atoi(file.Name())
+				if err == nil {
+					chunks = append(chunks, chunkNum)
+				}
+			}
+		}
+
+		// 将分片信息更新到Redis
+		for _, chunkNum := range chunks {
+			if err := h.redisService.AddUploadedChunk(ctx, req.FileID, chunkNum); err != nil {
+				log.Printf("更新分片信息到Redis失败: %v", err)
+				// 继续处理，不中断流程
+			}
+		}
+
+		log.Printf("从文件系统统计的分片数量: %d", len(chunks))
+	}
+
+	if len(chunks) != fileInfo.ChunkCount {
+		log.Printf("分片不完整: 期望=%d, 实际=%d", fileInfo.ChunkCount, len(chunks))
 		utils.JSONResponse(w, http.StatusBadRequest, map[string]interface{}{
 			"success": false,
 			"message": fmt.Sprintf("分片不完整, 已上传 %d/%d", len(chunks), fileInfo.ChunkCount),
 		})
 		return
 	}
+
+	log.Printf("所有分片已上传，开始合并: 文件ID=%s, 分片数=%d", req.FileID, fileInfo.ChunkCount)
 
 	// 提交合并任务到MQ
 	err = h.mergeService.PublishMergeTask(
@@ -453,12 +659,15 @@ func (h *FileHandler) CompleteUpload(w http.ResponseWriter, r *http.Request) {
 	)
 
 	if err != nil {
+		log.Printf("提交合并任务失败: %v", err)
 		utils.JSONResponse(w, http.StatusInternalServerError, map[string]interface{}{
 			"success": false,
 			"message": "提交合并任务失败: " + err.Error(),
 		})
 		return
 	}
+
+	log.Printf("合并任务提交成功: 文件ID=%s, 文件名=%s", fileInfo.FileID, fileInfo.FileName)
 
 	utils.JSONResponse(w, http.StatusOK, map[string]interface{}{
 		"success": true,

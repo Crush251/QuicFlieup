@@ -1,2 +1,8 @@
-cert.pem
-key.pem
+client/cert.pem
+client/key.pem
+client/1G
+client/10G
+server/cert.pem
+server/key.pem
+server/temp
+server/uploads

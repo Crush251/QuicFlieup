@@ -3,7 +3,9 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"crypto/md5"
 	"crypto/tls"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -252,13 +254,29 @@ func uploadFile() {
 	fileSize := fileInfo.Size()
 	totalChunks := int(math.Ceil(float64(fileSize) / float64(chunkSize)))
 
+	// 计算文件MD5哈希值
+	var fileHash string
+	if fileSize > 1024*1024*1024 { // 大于1GB的文件
+		fmt.Printf("文件大小超过1GB (%.2f GB)，计算快速哈希以提高效率...\n", float64(fileSize)/(1024*1024*1024))
+		// 对大文件计算部分哈希，避免耗时太长
+		fileHash, err = calculatePartialHash(file, fileSize)
+	} else {
+		fmt.Printf("计算文件完整哈希中，请耐心等待...\n")
+		fileHash, err = calculateFullHash(file)
+	}
+
+	if err != nil {
+		fmt.Printf("计算文件哈希失败: %v\n", err)
+		return
+	}
+
+	file.Seek(0, 0) // 重置文件指针到开头
+
+	// 生成文件ID
 	fileID := uuid.New().String() // 生成文件唯一标识
 
-	fmt.Printf("准备上传文件: %s (大小: %.2f MB, 分片数: %d)\n",
-		fileName, float64(fileSize)/(1024*1024), totalChunks)
-
-	// TODO: 计算文件哈希，这里简化处理，实际应该计算MD5
-	fileHash := "file-hash-" + fileID[:8]
+	fmt.Printf("准备上传文件: %s (大小: %.2f MB, 分片数: %d, 哈希: %s, ID: %s)\n",
+		fileName, float64(fileSize)/(1024*1024), totalChunks, fileHash, fileID)
 
 	// 创建初始化上传请求
 	initUploadReq := map[string]interface{}{
@@ -276,6 +294,7 @@ func uploadFile() {
 		return
 	}
 
+	fmt.Printf("发送初始化请求: %s\n", string(jsonData))
 	req, err := http.NewRequest("POST", apiBaseURL+"/initUpload", bytes.NewBuffer(jsonData))
 	if err != nil {
 		fmt.Printf("创建请求失败: %v\n", err)
@@ -285,7 +304,11 @@ func uploadFile() {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+token)
 
-	client := &http.Client{}
+	client := &http.Client{
+		Timeout: 30 * time.Second, // 设置30秒超时
+	}
+
+	fmt.Println("发送初始化上传请求...")
 	resp, err := client.Do(req)
 	if err != nil {
 		fmt.Printf("发送初始化请求失败: %v\n", err)
@@ -293,10 +316,48 @@ func uploadFile() {
 	}
 	defer resp.Body.Close()
 
-	var initResult map[string]interface{}
-	if err := json.NewDecoder(resp.Body).Decode(&initResult); err != nil {
-		fmt.Printf("解析响应失败: %v\n", err)
+	// 读取响应内容
+	responseBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		fmt.Printf("读取响应失败: %v\n", err)
 		return
+	}
+
+	// 记录完整响应内容用于调试
+	fmt.Printf("接收到初始化响应: HTTP状态码=%d\n响应内容: %s\n", resp.StatusCode, string(responseBody))
+	if resp.StatusCode != http.StatusOK {
+		fmt.Printf("服务器返回错误状态码: %d\n%s\n", resp.StatusCode, string(responseBody))
+		return
+	}
+
+	var initResult map[string]interface{}
+	if err := json.Unmarshal(responseBody, &initResult); err != nil {
+		fmt.Printf("解析响应失败: %v\n原始响应: %s\n", err, string(responseBody))
+		return
+	}
+
+	// 检查请求是否成功
+	success, ok := initResult["success"].(bool)
+	if !ok || !success {
+		message := "未知错误"
+		if msg, ok := initResult["message"].(string); ok {
+			message = msg
+		}
+		fmt.Printf("初始化上传失败: %s\n", message)
+		return
+	}
+
+	// 获取返回的文件信息
+	fileInfoMap, ok := initResult["fileInfo"].(map[string]interface{})
+	if !ok {
+		fmt.Println("响应中缺少文件信息")
+		return
+	}
+
+	// 使用服务器返回的文件ID，而不是客户端生成的
+	if serverFileID, ok := fileInfoMap["fileId"].(string); ok && serverFileID != "" {
+		fileID = serverFileID
+		fmt.Printf("使用服务器返回的文件ID: %s\n", fileID)
 	}
 
 	// 检查是否可以秒传
@@ -310,6 +371,7 @@ func uploadFile() {
 	getUploadedChunks(fileID, uploadedChunks)
 
 	// 上传文件分片
+	successful := true
 	for i := 0; i < totalChunks; i++ {
 		// 如果分片已上传，跳过
 		if uploadedChunks[i] {
@@ -331,18 +393,25 @@ func uploadFile() {
 		_, err := io.ReadFull(file, chunk)
 		if err != nil {
 			fmt.Printf("读取分片 %d 失败: %v\n", i, err)
-			return
+			successful = false
+			break
 		}
 
 		// 上传分片
 		success := uploadChunk(fileID, i, chunk)
 		if !success {
 			fmt.Printf("上传分片 %d 失败，中止上传\n", i)
-			return
+			successful = false
+			break
 		}
 
 		fmt.Printf("上传分片 %d/%d 成功 (%.2f%%)\n",
 			i+1, totalChunks, float64(i+1)/float64(totalChunks)*100)
+	}
+
+	if !successful {
+		fmt.Println("文件上传失败，请稍后重试")
+		return
 	}
 
 	// 完成上传
@@ -356,6 +425,7 @@ func uploadFile() {
 		return
 	}
 
+	fmt.Printf("发送完成上传请求: %s\n", string(jsonData))
 	req, err = http.NewRequest("POST", apiBaseURL+"/completeUpload", bytes.NewBuffer(jsonData))
 	if err != nil {
 		fmt.Printf("创建请求失败: %v\n", err)
@@ -365,6 +435,7 @@ func uploadFile() {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+token)
 
+	fmt.Println("请求合并文件...")
 	resp, err = client.Do(req)
 	if err != nil {
 		fmt.Printf("发送完成请求失败: %v\n", err)
@@ -372,21 +443,106 @@ func uploadFile() {
 	}
 	defer resp.Body.Close()
 
+	// 读取完整响应
+	responseBody, err = io.ReadAll(resp.Body)
+	if err != nil {
+		fmt.Printf("读取响应失败: %v\n", err)
+		return
+	}
+
+	// 检查HTTP状态码
+	fmt.Printf("收到完成上传响应: HTTP状态码=%d\n", resp.StatusCode)
+
+	if resp.StatusCode != http.StatusOK {
+		fmt.Printf("服务器返回错误状态码: %d\n响应内容: %s\n", resp.StatusCode, string(responseBody))
+		return
+	}
+
+	// 解析响应
 	var completeResult map[string]interface{}
-	if err := json.NewDecoder(resp.Body).Decode(&completeResult); err != nil {
-		fmt.Printf("解析响应失败: %v\n", err)
+	if err := json.Unmarshal(responseBody, &completeResult); err != nil {
+		fmt.Printf("解析响应失败: %v\n原始响应: %s\n", err, string(responseBody))
 		return
 	}
 
 	if success, ok := completeResult["success"].(bool); ok && success {
-		fmt.Println("文件上传完成！")
+		fmt.Println("文件上传完成！服务器正在处理合并任务，请稍后通过文件列表查看状态")
 	} else {
 		message := "未知错误"
 		if msg, ok := completeResult["message"].(string); ok {
 			message = msg
 		}
 		fmt.Printf("完成上传失败: %s\n", message)
+		fmt.Printf("完整响应内容: %s\n", string(responseBody))
 	}
+}
+
+// 计算完整文件的MD5哈希
+func calculateFullHash(file *os.File) (string, error) {
+	startTime := time.Now()
+	file.Seek(0, 0) // 重置文件指针到开头
+
+	hash := md5.New()
+	if _, err := io.Copy(hash, file); err != nil {
+		return "", fmt.Errorf("计算哈希失败: %w", err)
+	}
+
+	hashValue := hex.EncodeToString(hash.Sum(nil))
+	duration := time.Since(startTime)
+
+	fmt.Printf("完整哈希计算完成，耗时: %.2f秒, MD5=%s\n", duration.Seconds(), hashValue)
+	return hashValue, nil
+}
+
+// 对大文件计算部分哈希
+func calculatePartialHash(file *os.File, fileSize int64) (string, error) {
+	startTime := time.Now()
+	file.Seek(0, 0) // 重置文件指针到开头
+
+	// 选择文件的头部、中部和尾部进行采样
+	sampleSize := int64(10 * 1024 * 1024) // 每部分采样10MB
+	if sampleSize > fileSize/3 {
+		sampleSize = fileSize / 3
+	}
+
+	// 创建一个复合哈希
+	hash := md5.New()
+
+	// 读取文件头部
+	headBuffer := make([]byte, sampleSize)
+	if _, err := io.ReadFull(file, headBuffer); err != nil {
+		return "", fmt.Errorf("读取文件头部失败: %w", err)
+	}
+	hash.Write(headBuffer)
+
+	// 读取文件中部
+	middleOffset := (fileSize - sampleSize) / 2
+	file.Seek(middleOffset, 0)
+	middleBuffer := make([]byte, sampleSize)
+	if _, err := io.ReadFull(file, middleBuffer); err != nil {
+		return "", fmt.Errorf("读取文件中部失败: %w", err)
+	}
+	hash.Write(middleBuffer)
+
+	// 读取文件尾部
+	tailOffset := fileSize - sampleSize
+	file.Seek(tailOffset, 0)
+	tailBuffer := make([]byte, sampleSize)
+	if _, err := io.ReadFull(file, tailBuffer); err != nil {
+		return "", fmt.Errorf("读取文件尾部失败: %w", err)
+	}
+	hash.Write(tailBuffer)
+
+	// 计算文件大小的hash并加入
+	sizeBytes := []byte(fmt.Sprintf("%d", fileSize))
+	hash.Write(sizeBytes)
+
+	hashValue := hex.EncodeToString(hash.Sum(nil))
+	duration := time.Since(startTime)
+
+	fmt.Printf("对大文件计算快速哈希完成，采样大小:%.2fMB，耗时:%.2f秒, 快速哈希=%s\n",
+		float64(sampleSize*3)/(1024*1024), duration.Seconds(), hashValue)
+	return hashValue, nil
 }
 
 // 获取已上传的分片
